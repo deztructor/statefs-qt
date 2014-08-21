@@ -12,6 +12,30 @@
 #include <memory>
 #include <poll.h>
 
+namespace {
+
+// to wrap code to be executed from the code which does not support
+// exception handling
+template <typename F>
+void execute_nothrow(F fn, char const *msg)
+{
+    try{
+        fn();
+    } catch (std::future_error const &e) {
+        // skip, nothing can be done, maybe Qt has not delivered
+        // QEvent to the target, maybe something else is happened. Do
+        // not trace it because it can happen frequently in cases when
+        // component is frequently created/deleted
+    } catch (std::exception const &e) {
+        qWarning() << "Ignoring exception: " << e.what() << ". " << msg;
+    // } catch (...) {
+    //     // Those exceptions should not be catched, let's abort. Maybe
+    //     // this is something bad
+    //     qWarning() << "Unknown exception, ignoring. " << msg;
+    }
+}
+}
+
 namespace ckit
 {
 
@@ -111,8 +135,9 @@ bool PropertyMonitor::event(QEvent *e)
     if (e->type() < QEvent::User)
         return QObject::event(e);
 
-    auto t = static_cast<Event::Type>(e->type());
-    try {
+    auto res = true;
+    auto fn = [this, e, &res]() {
+        auto t = static_cast<Event::Type>(e->type());
         switch (t) {
         case Event::Subscribe: {
             auto p = dynamic_cast<SubscribeRequest*>(e);
@@ -132,13 +157,11 @@ bool PropertyMonitor::event(QEvent *e)
         }
         default:
             qWarning() << "Unknown user event";
-            return QObject::event(e);
+            res = QObject::event(e);
         }
-    } catch (std::exception const &ex) {
-        qWarning() << "PropertyMonitor::event: Caught '"
-                   << ex.what() << "' for " << t << "\n";
-    }
-    return true;
+    };
+    execute_nothrow(fn, __PRETTY_FUNCTION__);
+    return res;
 }
 
 void PropertyMonitor::subscribe(SubscribeRequest *req)
@@ -152,15 +175,14 @@ void PropertyMonitor::subscribe(SubscribeRequest *req)
         qWarning() << "Logic issue: subscription target is null";
         return;
     }
-    auto notify_on_exit = cor::on_scope_exit([req, &retval, tgt]() {
-            try {
-                req->value_.set_value(retval);
-            } catch (std::future_error const &e) {
-                qWarning() << "Future: no state, " << e.what();
-            }
-            QMetaObject::invokeMethod
-            (const_cast<ContextPropertyPrivate*>(tgt), "onChanged"
-             , Qt::QueuedConnection, Q_ARG(QVariant, retval));
+    auto notify_fn = [req, &retval, tgt]() {
+        req->value_.set_value(retval);
+        QMetaObject::invokeMethod
+        (const_cast<ContextPropertyPrivate*>(tgt), "onChanged"
+         , Qt::QueuedConnection, Q_ARG(QVariant, retval));
+    };
+    auto notify_on_exit = cor::on_scope_exit([notify_fn]() {
+            execute_nothrow(notify_fn, __PRETTY_FUNCTION__);
         });
 
     if (key.isEmpty()) {
@@ -190,11 +212,9 @@ void PropertyMonitor::subscribe(SubscribeRequest *req)
 void PropertyMonitor::unsubscribe(UnsubscribeRequest *req)
 {
     auto on_exit = cor::on_scope_exit([req]() {
-            try {
-                req->done_.set_value();
-            } catch (std::future_error const &e) {
-                qWarning() << "Future: no state, " << e.what();
-            }
+            execute_nothrow([req]() {
+                    req->done_.set_value();
+                }, __PRETTY_FUNCTION__);
         });
 
     auto tgt = req->tgt_;
@@ -510,69 +530,70 @@ const ContextPropertyInfo* ContextPropertyPrivate::info() const
 
 void ContextPropertyPrivate::subscribe() const
 {
-    if (state_ == Subscribing || state_ == Subscribed)
-        return;
+    auto fn = [this]() {
+        if (state_ == Subscribing || state_ == Subscribed)
+            return;
 
-    // unsubscription is asynchronous, so wait for it to be finished
-    // if resubcribing
-    if (state_ == Unsubscribing)
-        on_unsubscribed_.wait_for(std::chrono::milliseconds(20000));
+        // unsubscription is asynchronous, so wait for it to be finished
+        // if resubcribing
+        if (state_ == Unsubscribing)
+            on_unsubscribed_.wait_for(std::chrono::milliseconds(20000));
 
-    state_ = Subscribing;
-    std::promise<QVariant> res;
-    on_subscribed_ = res.get_future();
-    auto ev = new ckit::SubscribeRequest(this, key_, std::move(res));
-    actor()->postEvent(ev);
+        state_ = Subscribing;
+        std::promise<QVariant> res;
+        on_subscribed_ = res.get_future();
+        auto ev = new ckit::SubscribeRequest(this, key_, std::move(res));
+        actor()->postEvent(ev);
+    };
+    execute_nothrow(fn, __PRETTY_FUNCTION__);
 }
 
 void ContextPropertyPrivate::unsubscribe() const
 {
-    if (state_ == Unsubscribing)
-        return;
+    auto fn = [this]() {
+        if (state_ == Unsubscribing)
+            return;
 
-    try {
         std::promise<void> res;
         on_unsubscribed_ = res.get_future();
         auto ev = new ckit::UnsubscribeRequest(this, key_, std::move(res));
         actor()->postEvent(ev);
         state_ = Unsubscribing;
-    } catch (std::exception const &e) {
-        qWarning() << "unsubscribe: Caught '" << e.what() << "'\n";
-    }
+    };
+    execute_nothrow(fn, __PRETTY_FUNCTION__);
 }
 
 
 void ContextPropertyPrivate::waitForSubscription() const
 {
-    if (state_ != Subscribing)
-        return;
+    auto fn = [this]() {
+        if (state_ != Subscribing)
+            return;
 
-    try {
         auto status = cor::wait_for(on_subscribed_, std::chrono::milliseconds(2000));
         if (status == std::future_status::ready) {
             update(on_subscribed_.get());
         }
         state_ = Subscribed;
-    } catch (std::future_error const &e) {
-        // skip, nothing can be done, it seems Qt has not delivered
-        // QEvent to the target
-    } catch (std::exception const &e) {
-        qWarning() << "waitForSubscription: Caught '" << e.what() << "'\n";
-    }
+    };
+    execute_nothrow(fn, __PRETTY_FUNCTION__);
 }
 
 void ContextPropertyPrivate::waitForSubscription(bool block) const
 {
-    if (state_ != Subscribing)
-        return;
+    auto fn = [this, block]() {
+        if (state_ != Subscribing)
+            return;
 
-    if (block)
-        return waitForSubscription();
+        if (block)
+            return waitForSubscription();
 
-    while (state_ != Subscribed) {
-        QCoreApplication::processEvents();
-    }
-    state_ = Subscribed;
+        while (state_ != Subscribed)
+            QCoreApplication::processEvents();
+
+        state_ = Subscribed;
+    };
+    execute_nothrow(fn, __PRETTY_FUNCTION__);
 }
 
 void ContextPropertyPrivate::ignoreCommander()
